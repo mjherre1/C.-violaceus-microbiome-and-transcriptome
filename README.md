@@ -1,2 +1,4 @@
 # C.-violaceus-microbiome-and-transcriptome
-Scrips used for C. violaceus microbiome and transcriptome manuscript
+Scripts used for C. violaceus microbiome and transcriptome manuscript
+
+Contains R code for microbiome analysis and transcritptomic analysis (Heatmaps).
