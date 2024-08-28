@@ -1,0 +1,451 @@
+---
+title: "Microbiome_workflow_rmarkdown"
+output: html_document
+---
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r load library, echo=FALSE}
+#MJH edit Nov 2022
+
+####### WORKFLOW IN R ########
+
+############### Importing data & filtering #################
+#First begin by loading the required packages by highlighting the code 
+#below and running it.
+library(readxl)
+library(vegan)
+library(ggplot2)
+library(utils)
+library(biomformat)
+library(phyloseq)
+library(EcolUtils)
+library(tidyverse)
+library(magrittr)
+library(ggrepel)
+library(broom)
+
+#PAIRWISE ADONIS
+#install R tools from website
+#removed 00LOCk into different folder on computer
+#install.packages('devtools')
+#install.packages("processx")
+#install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis") 
+
+library(devtools)
+library(pairwiseAdonis)
+
+#INDICATOR SPECIES
+#install.packages("indicspecies")
+library(indicspecies)
+
+```
+```{r import files, echo=FALSE}
+
+#Set your working directory to folder of choice that contains metadata files and .qza files from qiime2
+#run getwd() to see what folder you are currently in or set the path in "Files"on bottom right quadrant
+setwd("/Users/michelle/Documents/German Lab Research Mac/All_Cv_Microbiome/R_stuff")
+
+#import metadata
+metadata_txt <- read_excel("Metadata_file.xlsx")
+
+#By default, qiime2 zips your data, along with provenance info, into a .qza or .qzv file.
+#Only need to unzip once. Thus, add a hashtag to these lines after finished. Rename the folder in your computer
+#unzip(zipfile = "Cv-content-CA-filtered-table_silva.qza")
+
+#Only need to unzip once. Rename the folder in your computer
+#unzip(zipfile = "taxonomy_silva.qza")
+
+#Check for these files in the 'files' tab. Rename them unzip_content_table, unzip_intestine_table, unzip_taxonomy
+
+#Now we will import our OTU table by specifying the location of the .biom file, which was obtained from unzipping the table.qza files.
+#The OTU table contains the sequence IDs of each OTU and their frequency across your samples.
+my_biom <- read_hdf5_biom("./unzip_content_table/data/feature-content-table.biom") #Change here within quotes.
+write_biom(my_biom, "formatted_biom")
+my_biom <- read_biom("formatted_biom")
+OTU_table <- as.data.frame(as.matrix(biom_data(my_biom))) #as tab separated file
+write.table(OTU_table, file = "OTU_table_CV_content_only.tsv", quote=FALSE, sep='\t', col.names = NA)
+
+#Next let's import taxonomy. Taxonomy should come from the unzipped taxonomy.qza file.
+#The taxonomy contains the taxa assigned to the OTU sequence ID.
+
+OTU_taxonomy <- read.delim("./unzip_taxonomy/data/taxonomy.tsv", row.names=1)
+```
+
+```{r merge taxonomy and metadata, echo=FALSE}
+#We must merge taxonomy to ESV IDs to filter out unwanted sequence IDs.
+OTU_table_plus_taxonomy <- as.data.frame(merge(OTU_taxonomy, 
+                                               OTU_table, by.x = "row.names", by.y = "row.names"))
+
+write.table(OTU_table_plus_taxonomy, file = "OTU_table_plus_taxonomy.tsv", quote=FALSE, sep='\t', col.names = NA)
+
+#First, filter out mock community standards by name.
+#Mock names modifiable in quotes. Multiple mocks = c("Mock1", "Mock2")
+
+OTU_no_mock <- OTU_table_plus_taxonomy[,!(names(OTU_table_plus_taxonomy) %in% c("Mock"))]
+
+#If no mocks, comment out this line by typing '#' in front of it, 
+#and replace OTU_no_mock with OTU_table in the next line/step.
+
+#Filters all rows that contain "unassigned" in their taxonomy.
+#You may not want to do this step if you have a lot of unassigned ESVs.
+
+OTU_table_no_unassigned <- OTU_no_mock[!grepl("Unassigned", 
+                                              OTU_no_mock$`Taxon`),]
+
+#To filter out chloroplasts, mitochondria, or other undersirable taxa by name:
+#Within the quotes should be what you wish to filter.
+
+OTU_table_no_mito <- OTU_table_no_unassigned[!grepl("Mitochondria",
+                                                      OTU_table_no_unassigned$`Taxon`),]
+
+OTU_table_no_chloro <- OTU_table_no_mito[!grepl("Chloroplast",
+                                                      OTU_table_no_mito$`Taxon`),]
+
+#To filter out the OTUs that do not have classification past the phylum level.d__bacteria is equivalent to k__bacteria
+#Remove comment character "#" if you wish to use.
+
+OTU_table_all_phyla <- OTU_table_no_chloro[grepl("d__Bacteria; p_", 
+                                                 OTU_table_no_chloro$`Taxon`),]
+row.names(OTU_table_all_phyla) <- OTU_table_all_phyla$Row.names
+
+#Removes taxonomy from the last column again so that it can be used for calculations.
+#Make sure you change the next line to use the proper OTU table.
+
+OTU_clean <- as.data.frame(t(OTU_table_all_phyla[,4:ncol(OTU_table_all_phyla)]))
+
+
+###Merges the metadata with the OTU table. Might have to change by.x or by.y parameters to match sample 
+##IDs
+
+row.names(metadata_txt) <- metadata_txt$sampleid
+
+merged_OTU_metadata <- merge(metadata_txt, OTU_clean, by.x = "row.names", by.y = "row.names")
+
+###Within the merged dataframe, returns the rows which match the key phrase in a specified column.
+
+
+```
+
+```{r rarefaction}
+############### Rarefying ##############
+#First, the data must be rarefied, which is the number of sequence reads that all samples will be 
+#normalized to.
+#You want to choose a rarefaction depth in which you minimize the number of samples lost, while 
+#maximizing diversity.
+#This command will help inform us of the read distribution across each sample.
+
+sort(rowSums(OTU_clean))
+barplot(sort(rowSums(OTU_clean)), ylim = c(0, max(rowSums(OTU_clean))), 
+        xlim = c(0, NROW(OTU_clean)), col = "Blue", ylab = "Read Depth", xlab = "Sample") 
+rarecurve(OTU_clean, step = 1000, label = FALSE)
+axis(side = 1, at = seq(0, 100000, by=2000))
+
+#Performing the actual rarefaction, be sure to change the 'Rd' to the proper rarefaction depth. 
+#Should be >= 1000 at least.
+
+#in qiime, recall chose 1100 for wild lump FHL, just use that number again (or whatever number you used
+
+Rd <- 7300
+rared_OTU <- as.data.frame((rrarefy.perm(OTU_clean, sample = Rd, n = 30, round.out = T)))
+
+#This only keeps the samples that meet the rarefaction cutoff.
+rared_OTU <- as.data.frame(rared_OTU[rowSums(rared_OTU) >= Rd-(Rd*.1), colSums(rared_OTU) >= 1])
+
+#Saves filtered & rarefied OTU table.
+write.table(t(rared_OTU), file = "OTU_filtered_plus_rarefied_content_only.tsv", quote=FALSE, sep='\t', col.names = NA)
+
+
+
+```
+```{r alpha diversity}
+############### Alpha diversity ##############
+#Alpha diversity is a measure of Diet richness within an environment.
+
+#Shannon diversity is a method of alpha-diversity.
+shannon <- as.data.frame(diversity(rared_OTU, index = "shannon"))
+
+#Merge with metadata to create a plot.
+
+merged_alpha <- merge(shannon, metadata_txt, by.x = "row.names", by.y = "row.names")
+
+
+#Test significance in alpha diversity
+
+Diet <- as.factor(merged_alpha$Diet)
+
+# Compute the analysis of variance
+# Summary of the analysis
+aov <- aov(formula = merged_alpha$`diversity(rared_OTU, index = "shannon")` ~ Diet)
+summary(aov)
+
+
+#Plotting alpha diversity:
+#Change '$<factor>' to categorical metadata factor you wish to plot. Change P and F value. 
+Diet <- as.factor(merged_alpha$Diet)
+
+#plot. use scale_fill_manual to change colors of box plots
+ggplot(data = merged_alpha) +
+  aes(x = Diet, y = merged_alpha$`diversity(rared_OTU, index = "shannon")`, 
+      fill = Diet) +
+  geom_boxplot(color="black", outlier.shape = NA, lwd = 1) +
+  labs(title = 'Shannon alpha-diversity', subtitle = bquote('P = 0.046,'~F~ '= 3.52'), 
+       x = 'Diet', y = 'Shannon index', fill = 'Diet') + scale_fill_manual(values=c('tomato','steelblue', 'plum3', 'gray50'))+ scale_x_discrete(name ="Diet", 
+                   limits=c("wild", "herbivore", "omnivore", "carnivore"))+ theme_classic(base_size = 14, base_line_size = 1)+
+  geom_jitter()
+
+
+#To save the plot onto folder
+
+ggsave(filename="Alpha_diversity_CV_contents.png") 
+
+
+#Test significance among group means. Note the p-values.
+#Change factor_X to metadata category of interest.
+
+TukeyHSD(aov(formula = merged_alpha$`diversity(rared_OTU, index = "shannon")` ~ Diet))
+
+```
+
+```{r beta diversity set up coordinates}
+############### Beta diversity ############
+#Beta diversity measures the change in diversity of Diet from one environment to another.
+#This will make our bray cutris distance matrix using the rarfied OTU table automatically.
+#Next, it will run an NMDS, which is a form of ordination and can be used to visualize beta diversity.
+
+NMDS1 <- metaMDS(rared_OTU, distance = "bray", k = 2)
+
+#This will make the first two columns as the x and y coordinates, so that they may be plotted easily.
+
+coordinates <- data.frame(NMDS1$points[,1:2])
+
+#Lets see how this looks like by actually plotting the data. 
+
+plot(x = coordinates$MDS1, y = coordinates$MDS2)
+
+#To make a more sophisticated plot, we will merge the stress scores with the metadata.
+
+nmds_plus_metadata <- merge(coordinates, metadata_txt, by.x = "row.names", by.y = "row.names")
+
+#Time to make a new plot colored with metadata. Change 'Factor_x' to the metadata factor of interest
+#will choose Diet again
+
+Diet <- as.factor(nmds_plus_metadata$Diet)
+
+#Plot
+
+ggplot(data = nmds_plus_metadata) +
+  aes(x = MDS1, y = MDS2, color = Diet)+ 
+  geom_point() +
+  labs(col = "Diet")+geom_polygon()
+
+#This next step merges the metadata and keeps only the samples 
+#that are present in the rarefied OTU table, so that we may run a permanova.
+#Adonis will result in an error if they do not match. Adonis is permanova
+#A permanova is a permutated analysis of variance, or a type of statistical test, useful for large 
+#multivariate analyses.
+#make sure to change the factor examining
+
+OTU_plus_metadata <- merge(rared_OTU, metadata_txt, by.x = "row.names", by.y = "row.names")
+row.names(OTU_plus_metadata) <- OTU_plus_metadata$Row.names
+OTU_plus_metadata <- OTU_plus_metadata[,-1]
+adonis(OTU_plus_metadata[,1:NCOL(rared_OTU)] ~ as.factor(OTU_plus_metadata$Diet), data = OTU_plus_metadata[,1:NCOL (rared_OTU)], permutations = 999, method = "bray")
+
+#PAIRWISE ADONIS
+#if Diet comparison and BH
+pairwise.adonis(x = OTU_plus_metadata[,1:NCOL(rared_OTU)], factors = OTU_plus_metadata$Diet, p.adjust.m = "BH")
+
+#if Diet comparison and FDR
+#pairwise.adonis(x = OTU_plus_metadata[,1:NCOL(rared_OTU)], factors = OTU_plus_metadata$Diet, p.adjust.m = "fdr")
+
+#source("parwise.adonis.rî")
+#using BH (or FDR is  is same as qiime p adjusted values)
+
+# Adonis is permanova in the vegan package!
+
+```
+
+
+```{r beta diversity plot}
+#We can add information like the p-value, r-squared and other information to the NMDS plot.
+#Please also add a title, P value and R squared value.
+#this creates an nmds plot with preassigned colors 
+
+ggplot(data = nmds_plus_metadata) +
+aes(x = MDS1, y = MDS2, color = Diet)+ #Creates and colors legend to match, modify after $.
+  geom_point(size=3) +
+  labs(col = "Diet") + #Renames legend, modifiable within quotes.
+  ggtitle("CV content only NMDS plot", subtitle = bquote('P < 0.001,'~R^2~ '= 0.396')) + #Adds tittle and subtitle. 
+  # Can modify p and r-squared values + title.
+  theme_classic(base_size = 14, base_line_size = .5)
+
+#change order of legend
+Diet <- factor(nmds_plus_metadata$Diet, levels = rev(levels(nmds_plus_metadata$Diet)))
+
+#assign colors to the dots and change shapes if wanted
+ggplot(data = nmds_plus_metadata) +
+  aes(x = MDS1, y = MDS2, group = Diet)+ #Creates and colors legend to match, modify after $.
+  geom_point(aes(shape=Diet, color=Diet), size=7) +
+  scale_shape_manual(values=c(19, 19, 19, 19))+
+  scale_color_manual(values=c('tomato','steelblue', 'plum3', 'gray50'))+ 
+  labs(col = "Diet") + #Renames legend, modifiable within quotes.
+  ggtitle("NMDS FHL wild contents only", subtitle = bquote('P < 0.001,'~R^2~ '= 0.396')) +#Adds tittle and subtitle. 
+  # Can modify p and r-squared values + title.
+  theme_classic(base_size = 14, base_line_size = .5)
+
+#save nmds plot
+ggsave(filename="NMDS_CV_content_nmds_shapes_colors_no_chloro_mito.png")
+```
+
+
+```{r add vectors to plot, finding features}
+#MAKING BIPLOT FOR FEATURE VECTORS
+OTU_table_individual<-rared_OTU %>%
+  as_tibble(rownames="Individual")
+
+subsample_tbl <- OTU_table_individual %>%
+  pivot_longer(-Individual)%>%
+  group_by(Individual) %>%
+  mutate(total = sum(value)) %>%
+  filter(total > 7300) %>%
+  uncount(value) %>%
+  slice_sample(n=7300) %>%
+  count(Individual, name) %>%
+  pivot_wider(names_from="name", values_from="n", values_fill=0) %>%
+  pivot_longer(-Individual)
+
+
+nmds_positions <- scores(NMDS1) %>%
+  as_tibble(rownames="Individual")
+
+subsample_tbl
+nmds_positions
+
+nmds_shared<- inner_join(subsample_tbl, nmds_positions)
+
+library(broom)
+cor_x <- nmds_shared %>%
+  nest(data = -name) %>%
+  mutate(cor_x = map(data, 
+                     ~cor.test(.x$value, .x$NMDS1, 
+                               method="spearman", 
+                               exact=FALSE) %>% tidy())) %>%
+  unnest(cor_x) %>%
+  select(name, estimate, p.value)
+
+cor_x
+
+cor_y <- nmds_shared %>%
+  nest(data = -name) %>%
+  mutate(cor_y = map(data, 
+                     ~cor.test(.x$value, .x$NMDS2, 
+                               method="spearman", 
+                               exact=FALSE) %>% tidy())) %>%
+  unnest(cor_y) %>%
+  select(name, estimate, p.value)
+
+cor_y
+
+correlations <- inner_join(cor_x, cor_y, by="name")
+```
+
+
+```{r add vectors to plot, choosing cutoff}
+#choose cutoff and adjust by how many taxa you want to have as high correlation
+#could shrink or increase p value 
+#has 67
+correlations %>%
+  filter(p.value.x < 0.1 | p.value.y < 0.1)
+
+#with p=0.05 has 45 taxa
+correlations %>%
+  filter(p.value.x < 0.05 | p.value.y < 0.05)
+```
+
+
+```{r add vectors to plot, choosing cutoff}
+#with p=0.005 has 4 taxa
+correlations %>%
+  filter(p.value.x < 0.005 | p.value.y < 0.005)
+```
+
+
+```{r add vectors to plot, choosing cutoff}
+#with p=0.0015 has 1 taxa
+correlations %>%
+  filter(p.value.x < 0.0015 | p.value.y < 0.0015)
+```
+
+
+
+```{r add vectors to plot, choosing cutoff}
+#with p=0.015 has 12 taxa
+correlations %>%
+  filter(p.value.x < 0.015 | p.value.y < 0.015)
+```
+
+
+```{r add vectors to plot, choosing cutoff}
+#try estimate as a filter has 34 taxa
+correlations %>%
+  filter(abs(estimate.x) > 0.75 | abs(estimate.y) > 0.75)
+```
+
+
+```{r add vectors to plot, choosing cutoff}
+#going to go with p value of 0.0015
+high_corr<- correlations %>%
+  filter(p.value.x < 0.015 | p.value.y < 0.015)
+
+high_corr
+
+high_corr %>%
+  ggplot(aes(x=0, xend=estimate.x, y=0, yend=estimate.y)) +
+  geom_segment()
+```
+
+
+```{r add vectors to plot, editing nmds}
+#plot segments on coordination, just need to get rid of group diet on aes MDS line
+ggplot(data = nmds_plus_metadata) +
+  aes(x = MDS1, y = MDS2)+ 
+  geom_point(aes(shape=Diet, color=Diet), size=7, fill = 'tomato') + 
+  geom_segment(data=high_corr, aes(x=0, xend=estimate.x, y=0, yend=estimate.y)) +
+  geom_text_repel(data=high_corr, aes(x=estimate.x, y=estimate.y, label=name), min.segment.length = 0.01) +
+  scale_shape_manual(values=c(25, 18, 17, 16)) +
+  scale_color_manual(values=c('tomato','steelblue', 'plum3', 'gray50'))+ 
+  labs(col = "Diet") + 
+  ggtitle("NMDS CV content", subtitle = bquote('P < 0.001,'~R^2~ '= 0.396')) + 
+  # Can modify p and r-squared values + title.
+  theme_classic(base_size = 14, base_line_size = .5)
+
+ggsave(filename="NMDS_vectors_names_Cv_content_no_chloro_mito.png") 
+
+#get rid of vector labels
+ggplot(data = nmds_plus_metadata) +
+  aes(x = MDS1, y = MDS2)+ 
+  geom_point(aes(shape=Diet, color=Diet), size=6, fill = 'tomato') + 
+  geom_segment(data=high_corr, aes(x=0, xend=estimate.x, y=0, yend=estimate.y)) +
+  scale_shape_manual(values=c(25, 18, 17, 16)) +
+  scale_color_manual(values=c('tomato','steelblue', 'plum3', 'gray50'))+ 
+  labs(col = "Diet") + 
+  ggtitle("NMDS CV content", subtitle = bquote('P < 0.001,'~R^2~ '= 0.396')) + 
+  # Can modify p and r-squared values + title.
+  theme_classic(base_size = 14, base_line_size = 2)
+
+ggsave(filename="NMDS_vectors_no_names_Cv_content_no_chloro_mito.png", width=7, height=5) 
+
+```
+```{r indicator species analysis}
+#INDICATOR SPECIES
+library(indicspecies)
+
+indicatorsp = multipatt(OTU_plus_metadata[,1:NCOL(rared_OTU)], OTU_plus_metadata$Diet, func = "r.g", control = how(nperm=9999))
+summary(indicatorsp)
+
+
+```
+
